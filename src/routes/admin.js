@@ -33,6 +33,8 @@ const {
   permanentDeleteUser,
   getFinanceSummary,
   getAdminExpenses,
+  getSystemSettings,
+  updateSystemSettings,
   getAdminTodayReport
 } = require('../controllers/adminController');
 
@@ -85,5 +87,7 @@ router.delete('/users/:id/permanent', permanentDeleteUser);
 router.get('/finance-summary', getFinanceSummary);
 router.get('/expenses', getAdminExpenses);
 router.get('/today-report', getAdminTodayReport);
+router.get('/system-settings/:branchId',  getSystemSettings);
+router.put('/system-settings/:branchId',  updateSystemSettings);
 
 module.exports = router;

@@ -35,6 +35,7 @@ const {
   replaceOrderPayment, 
   updateActiveOrder,
   payDeliveryBoyFuel,
+  getCashierSystemInfo,
 } = require('../controllers/cashierController');
 
 const {
@@ -129,6 +130,7 @@ router.post('/payments/replace', replaceOrderPayment);
 router.put('/orders/:id/update-items', updateActiveOrder);
 router.get('/delivery/stats',    deliveryController.getDeliveryBoyStats);
 router.post('/delivery/pay-fuel', payDeliveryBoyFuel);
+router.get('/system-info', getCashierSystemInfo);
 
 
 module.exports = router;

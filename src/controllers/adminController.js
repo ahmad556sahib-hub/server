@@ -1228,5 +1228,63 @@ exports.getAdminTodayReport = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
+// ========== SYSTEM SETTINGS ==========
+exports.getSystemSettings = async (req, res) => {
+  try {
+    const { branchId } = req.params;
+    const branch = await Branch.findById(branchId)
+      .select('name kitchenSystemEnabled barmanSystemEnabled');
+    if (!branch)
+      return res.status(404).json({ success: false, message: 'Branch not found' });
+
+    res.json({
+      success: true,
+      settings: {
+        branchId:              branch._id,
+        branchName:            branch.name,
+        kitchenSystemEnabled:  branch.kitchenSystemEnabled !== false,
+        barmanSystemEnabled:   branch.barmanSystemEnabled  !== false,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.updateSystemSettings = async (req, res) => {
+  try {
+    const { branchId } = req.params;
+    const { kitchenSystemEnabled, barmanSystemEnabled } = req.body;
+
+    const updateData = {};
+    if (kitchenSystemEnabled !== undefined)
+      updateData.kitchenSystemEnabled = Boolean(kitchenSystemEnabled);
+    if (barmanSystemEnabled !== undefined)
+      updateData.barmanSystemEnabled  = Boolean(barmanSystemEnabled);
+
+    const branch = await Branch.findByIdAndUpdate(
+      branchId,
+      { $set: updateData },
+      { new: true }
+    ).select('name kitchenSystemEnabled barmanSystemEnabled');
+
+    if (!branch)
+      return res.status(404).json({ success: false, message: 'Branch not found' });
+
+    res.json({
+      success: true,
+      message: 'System settings updated',
+      settings: {
+        branchId:              branch._id,
+        branchName:            branch.name,
+        kitchenSystemEnabled:  branch.kitchenSystemEnabled !== false,
+        barmanSystemEnabled:   branch.barmanSystemEnabled  !== false,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
  
 module.exports = exports;

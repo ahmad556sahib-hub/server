@@ -6,6 +6,8 @@ const ColdDrink = require('../models/Colddrink');
 const Table = require('../models/Table');
 const User = require('../models/User');
 const { generateOrderNumber, calculateTotalTime, calculateOrderTotal } = require('../utils/helpers');
+const { getSystemSettings } = require('../utils/systemSettings');
+const { deductFoodIngredientsForOrder, deductColdDrinksForOrder } = require('../utils/inventoryDeduction');
 
 const BRANCH_NAME = 'Al Madina Fast Food Shahkot';
 
@@ -189,9 +191,13 @@ exports.createOrder = async (req, res) => {
       notes, cashierNote, deliveryBoyId,
     } = req.body;
 
-    if (!items || items.length === 0) {
+    if (!items || items.length === 0)
       return res.status(400).json({ success: false, message: 'Order must have at least one item' });
-    }
+
+    const branchId = req.user.branchId;
+
+    // ── System settings check ──────────────────────────────────────────────
+    const { kitchenSystemEnabled, barmanSystemEnabled } = await getSystemSettings(branchId);
 
     const processedItems = items.map(item => {
       let itemType = 'Product';
@@ -200,112 +206,73 @@ exports.createOrder = async (req, res) => {
       return {
         ...item,
         itemType: item.itemType || itemType,
-        // ✅ ADDED: customizations array save karo (waiter/cashier mobile se aata hai)
         customizations: Array.isArray(item.customizations) ? item.customizations : [],
         note: item.note || null,
       };
     });
 
     if (orderType === 'dine_in') {
-      if (!tableNumber || !floor) {
-        return res.status(400).json({
-          success: false,
-          message: 'Table number aur floor zaroori hai dine-in orders ke liye',
-        });
-      }
-      if (!FLOORS.includes(floor)) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid floor: ${floor}. Valid: ${FLOORS.join(', ')}`,
-        });
-      }
-      if (tableNumber < 1 || tableNumber > TABLES_PER_FLOOR) {
-        return res.status(400).json({
-          success: false,
-          message: `Table number 1-${TABLES_PER_FLOOR} ke beech hona chahiye`,
-        });
-      }
+      if (!tableNumber || !floor)
+        return res.status(400).json({ success: false, message: 'Table number aur floor zaroori hai' });
+      if (!FLOORS.includes(floor))
+        return res.status(400).json({ success: false, message: `Invalid floor: ${floor}` });
     }
-
     if (orderType === 'delivery') {
-      if (!customerName || !customerPhone) {
-        return res.status(400).json({
-          success: false,
-          message: 'Customer name aur phone zaroori hai delivery orders ke liye',
-        });
-      }
-      if (!deliveryAddress) {
-        return res.status(400).json({
-          success: false,
-          message: 'Delivery address zaroori hai',
-        });
-      }
-    }
-
-    for (const item of processedItems) {
-      if (item.type === 'cold_drink') {
-        const coldDrink = await ColdDrink.findOne({ 'sizes._id': item.itemId });
-        if (coldDrink) {
-          const sizeVariant = coldDrink.sizes.id(item.itemId);
-          if (sizeVariant && sizeVariant.currentStock < item.quantity) {
-            return res.status(400).json({
-              success: false,
-              message: `Insufficient stock for ${coldDrink.name} (${sizeVariant.size})`,
-            });
-          }
-        }
-      }
+      if (!customerName || !customerPhone)
+        return res.status(400).json({ success: false, message: 'Customer name aur phone zaroori hai' });
+      if (!deliveryAddress)
+        return res.status(400).json({ success: false, message: 'Delivery address zaroori hai' });
     }
 
     const { subtotal, tax, total } = calculateOrderTotal(processedItems, 0, 0);
     const estimatedTime = calculateTotalTime(processedItems);
 
-    // ✅ ADDED: Detect cold drinks
-    const hasColdDrinksInOrder = processedItems.some(
-      item => item.isColdDrink || item.type === 'cold_drink'
-    );
+    const hasColdDrinksInOrder = processedItems.some(i => i.isColdDrink || i.type === 'cold_drink');
+
+    // ── Determine initial status based on kitchen system ──────────────────
+    // Kitchen OFF → order starts as 'ready' (skip chef), deduct ingredients now
+    // Kitchen ON  → order starts as 'pending' (chef accepts)
+    const initialStatus = kitchenSystemEnabled ? 'pending' : 'ready';
+    const initialStockDed = !kitchenSystemEnabled; // if kitchen OFF, stock deducted at creation
+
+    // ── Determine coldDrinksStatus based on barman system ─────────────────
+    // Barman OFF → auto-delivered, deduct from ColdDrink inventory now
+    // Barman ON  → pending (barman delivers)
+    const coldDrinksStatus = (!hasColdDrinksInOrder || !barmanSystemEnabled)
+      ? 'delivered'
+      : 'pending';
 
     let finalCashierNote = cashierNote || '';
     if (!finalCashierNote) {
-      if (orderType === 'dine_in') {
-        const floorLabel = (floor || '').replace(/_/g, ' ');
-        finalCashierNote = `🪑 Dine In — Table ${tableNumber} (${floorLabel})`;
-      } else if (orderType === 'takeaway') {
-        const nameStr = customerName ? customerName : 'Walk-in';
-        const phoneStr = customerPhone ? ' | ' + customerPhone : '';
-        finalCashierNote = `🥡 Takeaway — ${nameStr}${phoneStr}`;
-      } else if (orderType === 'delivery') {
+      if (orderType === 'dine_in')
+        finalCashierNote = `🪑 Dine In — Table ${tableNumber} (${(floor || '').replace(/_/g, ' ')})`;
+      else if (orderType === 'takeaway')
+        finalCashierNote = `🥡 Takeaway — ${customerName || 'Walk-in'}${customerPhone ? ' | ' + customerPhone : ''}`;
+      else if (orderType === 'delivery')
         finalCashierNote = `🚚 Delivery — ${customerName} | ${customerPhone}`;
-      }
     }
 
     const orderData = {
       orderNumber: await generateOrderNumber(),
-      branchId: req.user.branchId,
+      branchId,
       orderType,
       items: processedItems,
       subtotal, tax, total, estimatedTime,
       waiterId: req.user._id,
       notes,
       cashierNote: finalCashierNote,
-      status: 'pending',
+      status: initialStatus,
+      stockDeducted: initialStockDed,
       updatedByWaiter: false,
-      stockDeducted: false,
-      // ✅ ADDED: Cold drinks flags
       hasColdDrinks: hasColdDrinksInOrder,
-      coldDrinksStatus: hasColdDrinksInOrder ? 'pending' : 'delivered',
+      coldDrinksStatus,
     };
 
-    if (orderType === 'dine_in') {
-      orderData.tableNumber = tableNumber;
-      orderData.floor = floor;
-    }
-
+    if (orderType === 'dine_in') { orderData.tableNumber = tableNumber; orderData.floor = floor; }
     if (orderType === 'takeaway' || orderType === 'delivery') {
       if (customerName) orderData.customerName = customerName;
       if (customerPhone) orderData.customerPhone = customerPhone;
     }
-
     if (orderType === 'delivery') {
       orderData.deliveryAddress = deliveryAddress;
       if (deliveryBoyId) orderData.deliveryBoyId = deliveryBoyId;
@@ -313,35 +280,27 @@ exports.createOrder = async (req, res) => {
 
     const order = await Order.create(orderData);
 
+    // ── Table occupancy ────────────────────────────────────────────────────
     if (orderType === 'dine_in') {
-      let table = await Table.findOne({
-        branchId: req.user.branchId,
-        tableNumber,
-        floor,
-      });
-
+      let table = await Table.findOne({ branchId, tableNumber, floor });
       if (!table) {
-        table = await Table.create({
-          tableNumber,
-          capacity: TABLE_CAPACITY,
-          floor,
-          branchId: req.user.branchId,
-          isActive: true,
-          isOccupied: false,
-        });
+        table = await Table.create({ tableNumber, capacity: TABLE_CAPACITY, floor, branchId, isActive: true, isOccupied: false });
       }
-
       if (table.isOccupied) {
         await Order.findByIdAndDelete(order._id);
-        return res.status(400).json({
-          success: false,
-          message: `Table ${tableNumber} (${floor.replace(/_/g, ' ')}) already occupied hai`,
-        });
+        return res.status(400).json({ success: false, message: `Table ${tableNumber} (${floor.replace(/_/g, ' ')}) already occupied` });
       }
-
       table.isOccupied = true;
       table.currentOrderId = order._id;
       await table.save();
+    }
+
+    // ── Deduct inventory when kitchen/barman system OFF ────────────────────
+    if (!kitchenSystemEnabled) {
+      await deductFoodIngredientsForOrder(processedItems);
+    }
+    if (hasColdDrinksInOrder && !barmanSystemEnabled) {
+      await deductColdDrinksForOrder(processedItems);
     }
 
     const populatedOrder = await Order.findById(order._id)
@@ -352,34 +311,30 @@ exports.createOrder = async (req, res) => {
     const io = req.app.get('io');
     if (io) {
       if (orderType === 'delivery' && deliveryBoyId) {
-        io.to(`branch-${req.user.branchId}`).emit('delivery-assigned', {
-          orderId: String(populatedOrder._id),
-          orderNumber: populatedOrder.orderNumber,
-          customerName,
-          deliveryAddress,
-          total,
-          deliveryBoyId: String(deliveryBoyId),
-          assignedBy: req.user.name || 'Waiter',
+        io.to(`branch-${branchId}`).emit('delivery-assigned', {
+          orderId: String(order._id), orderNumber: order.orderNumber,
+          customerName, deliveryAddress, total,
+          deliveryBoyId: String(deliveryBoyId), assignedBy: req.user.name || 'Waiter',
         });
       }
-
-      // ✅ ADDED: Barman ko notify karo agar cold drinks hain
-      if (hasColdDrinksInOrder) {
-        io.to(`branch-${String(req.user.branchId)}`).emit('new-colddrink-order', {
-          orderId: String(order._id),
-          orderNumber: order.orderNumber,
-          orderType: order.orderType,
-          tableNumber: order.tableNumber || null,
-          floor: order.floor || null,
-          total: order.total,
+      // Notify barman only if barman system is ON
+      if (hasColdDrinksInOrder && barmanSystemEnabled) {
+        io.to(`branch-${String(branchId)}`).emit('new-colddrink-order', {
+          orderId: String(order._id), orderNumber: order.orderNumber,
+          orderType: order.orderType, tableNumber: order.tableNumber || null,
+          floor: order.floor || null, total: order.total,
           coldDrinkItems: processedItems
             .filter(i => i.isColdDrink || i.type === 'cold_drink')
-            .map(i => ({
-              name: i.name,
-              size: i.size || null,
-              quantity: i.quantity,
-            })),
+            .map(i => ({ name: i.name, size: i.size || null, quantity: i.quantity })),
           message: `🧃 New cold drink order #${order.orderNumber}`,
+        });
+      }
+      // Notify chef only if kitchen system is ON
+      if (kitchenSystemEnabled) {
+        io.to(`branch-${String(branchId)}`).emit('new-order', {
+          orderId: order._id, orderNumber: order.orderNumber,
+          orderType: order.orderType, tableNumber: order.tableNumber,
+          floor: order.floor, total: order.total, itemCount: processedItems.length,
         });
       }
     }
@@ -387,9 +342,8 @@ exports.createOrder = async (req, res) => {
     res.status(201).json({
       success: true,
       order: populatedOrder,
-      message: orderType === 'delivery' && !deliveryBoyId
-        ? 'Order create ho gayi. Chef ready karega tab delivery boy ko notify kiya jayega.'
-        : 'Order successfully create ho gayi',
+      systemInfo: { kitchenSystemEnabled, barmanSystemEnabled },
+      message: 'Order successfully create ho gayi',
     });
   } catch (error) {
     console.error('Create order error:', error);

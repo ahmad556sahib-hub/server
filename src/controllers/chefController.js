@@ -4,6 +4,8 @@ const ChefInventory = require('../models/Chefinventory');
 const { InventoryRequest, InventoryTransaction } = require('../models/InventoryOfficer');
 const notificationService = require('../services/notificationService');
 const InventoryReturnRequest = require('../models/InventoryReturnRequest');
+const { getSystemSettings } = require('../utils/systemSettings');
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  UNIT CONVERSION HELPER
@@ -44,14 +46,16 @@ const getTodayRange = () => {
 
 exports.getPendingOrders = async (req, res) => {
   try {
-    const branchId = req.user.branchId;
+    const { kitchenSystemEnabled } = await getSystemSettings(req.user.branchId);
 
-    // ✅ CHANGED: Chef sirf woh orders dekhe jin mein kam se kam ek food item ho
-    // Cold-drink-only orders barman handle karta hai, chef nahi
+    // Kitchen system OFF → chef ko koi orders nahi milne chahiyein
+    if (!kitchenSystemEnabled) {
+      return res.json({ success: true, orders: [], count: 0, kitchenSystemEnabled: false });
+    }
+
     const orders = await Order.find({
-      branchId,
+      branchId: req.user.branchId,
       status: 'pending',
-      // Ensure at least one non-cold-drink item exists in the order
       items: {
         $elemMatch: {
           isColdDrink: { $ne: true },
@@ -64,7 +68,7 @@ exports.getPendingOrders = async (req, res) => {
       .sort({ createdAt: 1 })
       .lean();
 
-    res.json({ success: true, orders, count: orders.length });
+    res.json({ success: true, orders, count: orders.length, kitchenSystemEnabled: true });
   } catch (error) {
     console.error('getPendingOrders error:', error);
     res.status(500).json({ success: false, message: error.message });
@@ -102,9 +106,16 @@ exports.getMyOrders = async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 exports.acceptOrder = async (req, res) => {
   try {
+    const { kitchenSystemEnabled } = await getSystemSettings(req.user.branchId);
+    if (!kitchenSystemEnabled) {
+      return res.status(400).json({
+        success: false,
+        message: 'Kitchen system is disabled. Admin se enable karwayein.',
+      });
+    }
+
     const { orderId } = req.body;
 
-    // ── ✅ INVENTORY CHECK: aaj ki active inventory zaroori hai ──────────────
     const { today, tomorrow } = getTodayRange();
     const activeInventory = await ChefInventory.findOne({
       chefId: req.user._id,
@@ -115,21 +126,17 @@ exports.acceptOrder = async (req, res) => {
     if (!activeInventory) {
       return res.status(400).json({
         success: false,
-        noInventory: true,   // ✅ frontend is flag se special message dikhayega
-        message:
-          'Aapke paas aaj ki inventory issue nahi hui hai. ' +
-          'Pehle inventory officer se inventory lein, phir order accept karein.',
+        noInventory: true,
+        message: 'Aapke paas aaj ki inventory issue nahi hui. IO se inventory lein.',
       });
     }
 
-    // ── Order fetch & validate ───────────────────────────────────────────────
     const order = await Order.findById(orderId);
     if (!order)
       return res.status(404).json({ success: false, message: 'Order not found' });
     if (order.status !== 'pending')
       return res.status(400).json({ success: false, message: 'Order is not pending' });
 
-    // ── Seedha 'preparing' ───────────────────────────────────────────────────
     order.status = 'preparing';
     order.chefId = req.user._id;
     order.acceptedAt = new Date();

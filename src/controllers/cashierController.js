@@ -10,6 +10,9 @@ const Inventory = require('../models/Inventory');
 const Expense = require('../models/Expense'); // ✅ NEW
 const { PaymentStatus } = require('../config/constants');
 const { generateOrderNumber, calculateTotalTime, calculateOrderTotal } = require('../utils/helpers');
+const { getSystemSettings } = require('../utils/systemSettings');
+const { deductFoodIngredientsForOrder, deductColdDrinksForOrder } = require('../utils/inventoryDeduction');
+
 
 const BRANCH_NAME = 'Al Madina Fast Food Shahkot';
 
@@ -376,14 +379,15 @@ exports.receivePayment = async (req, res) => {
       .populate('deliveryBoyId', 'name')
       .populate('items.itemId');
 
-    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!order)
+      return res.status(404).json({ success: false, message: 'Order not found' });
 
-    // ✅ ADDED: Cold drinks validation
-    // Agar order mein cold drinks hain aur barman ne deliver nahi ki toh payment rok do
-    if (order.hasColdDrinks && order.coldDrinksStatus !== 'delivered') {
+    // ── Cold drinks check — only if barman system is ON ───────────────────
+    const { barmanSystemEnabled } = await getSystemSettings(order.branchId);
+    if (barmanSystemEnabled && order.hasColdDrinks && order.coldDrinksStatus !== 'delivered') {
       return res.status(400).json({
         success: false,
-        message: 'Cold drinks abhi barman ne deliver nahi ki hain. Pehle barman se confirm karein.',
+        message: 'Cold drinks abhi barman ne deliver nahi ki hain.',
         coldDrinksStatus: order.coldDrinksStatus,
         hasColdDrinks: true,
       });
@@ -397,18 +401,14 @@ exports.receivePayment = async (req, res) => {
     const changeAmount = Math.max(0, Number(finalReceived) - remainingAmount);
 
     const payment = await Payment.create({
-      orderId,
-      branchId: req.user.branchId,
-      amount: finalAmount,
-      method,
+      orderId, branchId: req.user.branchId,
+      amount: finalAmount, method,
       status: PaymentStatus.PAID,
       cashierId: req.user._id,
       waiterId: order.waiterId,
       deliveryBoyId: order.deliveryBoyId,
       receivedAmount: finalReceived,
-      changeAmount,
-      transactionId,
-      notes,
+      changeAmount, transactionId, notes,
       paidAt: new Date(),
     });
 
@@ -865,11 +865,14 @@ exports.createOrder = async (req, res) => {
       deliveryAddress, cashierNote, notes, discount = 0, items = [],
     } = req.body;
 
-    if (!items || items.length === 0) {
+    if (!items || items.length === 0)
       return res.status(400).json({ success: false, message: 'Items required' });
-    }
 
     const branchId = req.user.branchId;
+
+    // ── System settings ────────────────────────────────────────────────────
+    const { kitchenSystemEnabled, barmanSystemEnabled } = await getSystemSettings(branchId);
+
     let subtotal = 0;
     const processedItems = [];
 
@@ -877,16 +880,14 @@ exports.createOrder = async (req, res) => {
       const itemSubtotal = item.subtotal != null
         ? Number(item.subtotal)
         : Number(item.price || 0) * Number(item.quantity || 1);
-
       subtotal += itemSubtotal;
-
       processedItems.push({
         itemId: item.itemId,
         itemType: item.itemType || 'Product',
         type: item.type || 'product',
         name: item.name || 'Item',
         size: item.size || null,
-        note: item.note || null,        // ✅ FIX: Remove/Less/Extra/Cook/Portion notes
+        note: item.note || null,
         quantity: Number(item.quantity) || 1,
         price: Number(item.price) || 0,
         subtotal: itemSubtotal,
@@ -899,17 +900,21 @@ exports.createOrder = async (req, res) => {
 
     const discountAmt = Math.min(Number(discount) || 0, subtotal);
     const total = subtotal - discountAmt;
-
     const orderNumber = await generateOrderNumber();
 
-    // Detect cold drinks in order
     const hasColdDrinksInOrder = processedItems.some(
-      item => item.isColdDrink || item.type === 'cold_drink'
+      i => i.isColdDrink || i.type === 'cold_drink'
     );
 
+    // ── Initial states based on system settings ────────────────────────────
+    const initialStatus = kitchenSystemEnabled ? 'pending' : 'ready';
+    const initialStockDed = !kitchenSystemEnabled;
+    const coldDrinksStatus = (!hasColdDrinksInOrder || !barmanSystemEnabled)
+      ? 'delivered'
+      : 'pending';
+
     const order = await Order.create({
-      orderNumber,
-      branchId,
+      orderNumber, branchId,
       orderType: orderType || 'dine_in',
       tableNumber: tableNumber || null,
       floor: floor || null,
@@ -919,14 +924,12 @@ exports.createOrder = async (req, res) => {
       cashierNote: cashierNote || '',
       notes: notes || '',
       items: processedItems,
-      subtotal,
-      discount: discountAmt,
-      total,
-      tax: 0,
-      status: 'pending',
+      subtotal, discount: discountAmt, total, tax: 0,
+      status: initialStatus,
+      stockDeducted: initialStockDed,
       cashierId: req.user._id,
       hasColdDrinks: hasColdDrinksInOrder,
-      coldDrinksStatus: hasColdDrinksInOrder ? 'pending' : 'delivered',
+      coldDrinksStatus,
     });
 
     if (orderType === 'dine_in' && tableNumber && floor) {
@@ -934,6 +937,14 @@ exports.createOrder = async (req, res) => {
         { branchId, tableNumber, floor },
         { isOccupied: true, currentOrderId: order._id }
       );
+    }
+
+    // ── Deduct immediately if systems are OFF ──────────────────────────────
+    if (!kitchenSystemEnabled) {
+      await deductFoodIngredientsForOrder(processedItems);
+    }
+    if (hasColdDrinksInOrder && !barmanSystemEnabled) {
+      await deductColdDrinksForOrder(processedItems);
     }
 
     const populatedOrder = await Order.findById(order._id)
@@ -944,31 +955,23 @@ exports.createOrder = async (req, res) => {
 
     const io = req.app.get('io');
     if (io) {
-      io.to(String(branchId)).emit('new-order', {
-        orderId: order._id,
-        orderNumber: order.orderNumber,
-        orderType: order.orderType,
-        tableNumber: order.tableNumber,
-        floor: order.floor,
-        total: order.total,
-        itemCount: processedItems.length,
-      });
-
-      if (hasColdDrinksInOrder) {
+      // Notify chef only if kitchen ON
+      if (kitchenSystemEnabled) {
+        io.to(String(branchId)).emit('new-order', {
+          orderId: order._id, orderNumber: order.orderNumber,
+          orderType: order.orderType, tableNumber: order.tableNumber,
+          floor: order.floor, total: order.total, itemCount: processedItems.length,
+        });
+      }
+      // Notify barman only if barman ON
+      if (hasColdDrinksInOrder && barmanSystemEnabled) {
         io.to(String(branchId)).emit('new-colddrink-order', {
-          orderId: String(order._id),
-          orderNumber: order.orderNumber,
-          orderType: order.orderType,
-          tableNumber: order.tableNumber || null,
-          floor: order.floor || null,
-          total: order.total,
+          orderId: String(order._id), orderNumber: order.orderNumber,
+          orderType: order.orderType, tableNumber: order.tableNumber || null,
+          floor: order.floor || null, total: order.total,
           coldDrinkItems: processedItems
             .filter(i => i.isColdDrink || i.type === 'cold_drink')
-            .map(i => ({
-              name: i.name,
-              size: i.size,
-              quantity: i.quantity,
-            })),
+            .map(i => ({ name: i.name, size: i.size, quantity: i.quantity })),
           message: `🧃 New cold drink order #${order.orderNumber}`,
         });
       }
@@ -977,6 +980,7 @@ exports.createOrder = async (req, res) => {
     res.status(201).json({
       success: true,
       order: populatedOrder,
+      systemInfo: { kitchenSystemEnabled, barmanSystemEnabled },
       message: `Order #${orderNumber} created successfully`,
     });
   } catch (error) {
@@ -984,6 +988,7 @@ exports.createOrder = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
 
 exports.getAmountSummary = async (req, res) => {
   try {
@@ -1395,6 +1400,16 @@ exports.payDeliveryBoyFuel = async (req, res) => {
     });
   } catch (error) {
     console.error('Pay delivery boy fuel error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+exports.getCashierSystemInfo = async (req, res) => {
+  try {
+    const { getSystemSettings } = require('../utils/systemSettings');
+    const settings = await getSystemSettings(req.user.branchId);
+    res.json({ success: true, ...settings });
+  } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };

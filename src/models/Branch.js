@@ -8,7 +8,9 @@ const branchSchema = new mongoose.Schema({
   managerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   isActive: { type: Boolean, default: true },
   openingTime: { type: String, default: '09:00' },
-  closingTime: { type: String, default: '23:00' }
+  closingTime: { type: String, default: '23:00' },
+  kitchenSystemEnabled: { type: Boolean, default: true },
+  barmanSystemEnabled: { type: Boolean, default: true },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Branch', branchSchema);

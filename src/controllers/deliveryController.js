@@ -4,6 +4,8 @@ const Deal = require('../models/Deal');
 const Inventory = require('../models/Inventory');
 const ColdDrink = require('../models/Colddrink');
 const { generateOrderNumber, calculateTotalTime, calculateOrderTotal } = require('../utils/helpers');
+const { getSystemSettings } = require('../utils/systemSettings');
+const { deductFoodIngredientsForOrder, deductColdDrinksForOrder } = require('../utils/inventoryDeduction');
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 const resolveItemType = (item) => {
@@ -68,30 +70,24 @@ exports.createDeliveryOrder = async (req, res) => {
   try {
     const {
       items, customerName, customerPhone,
-      deliveryAddress, notes,
-      orderType = 'delivery',
+      deliveryAddress, notes, orderType = 'delivery',
     } = req.body;
 
-    if (!customerName || !customerPhone) {
+    if (!customerName || !customerPhone)
       return res.status(400).json({ success: false, message: 'Customer name aur phone zaroori hain' });
-    }
-    if (orderType === 'delivery' && !deliveryAddress) {
+    if (orderType === 'delivery' && !deliveryAddress)
       return res.status(400).json({ success: false, message: 'Delivery address zaroori hai' });
-    }
-    if (!items || items.length === 0) {
+    if (!items || items.length === 0)
       return res.status(400).json({ success: false, message: 'Kam se kam ek item hona chahiye' });
-    }
 
-    const resolveItemType = (item) => {
-      if (item.itemType) return item.itemType;
-      if (item.type === 'cold_drink') return 'Inventory';
-      if (item.type === 'deal') return 'Deal';
-      return 'Product';
-    };
+    const branchId = req.user.branchId;
+
+    // ── System settings ────────────────────────────────────────────────────
+    const { kitchenSystemEnabled, barmanSystemEnabled } = await getSystemSettings(branchId);
 
     const processedItems = items.map(item => ({
       ...item,
-      itemType: resolveItemType(item),
+      itemType: item.itemType || (item.type === 'cold_drink' ? 'Inventory' : item.type === 'deal' ? 'Deal' : 'Product'),
     }));
 
     // Stock check for cold drinks
@@ -101,12 +97,8 @@ exports.createDeliveryOrder = async (req, res) => {
           const coldDrink = await ColdDrink.findOne({ 'sizes._id': item.itemId });
           if (coldDrink) {
             const sizeVariant = coldDrink.sizes.id(item.itemId);
-            if (sizeVariant && sizeVariant.currentStock < item.quantity) {
-              return res.status(400).json({
-                success: false,
-                message: `Insufficient stock: ${coldDrink.name} (${sizeVariant.size})`,
-              });
-            }
+            if (sizeVariant && sizeVariant.currentStock < item.quantity)
+              return res.status(400).json({ success: false, message: `Insufficient stock: ${coldDrink.name} (${sizeVariant.size})` });
           }
         } catch { }
       }
@@ -115,60 +107,56 @@ exports.createDeliveryOrder = async (req, res) => {
     const { subtotal, tax, total } = calculateOrderTotal(processedItems, 0, 0);
     const estimatedTime = calculateTotalTime(processedItems) + (orderType === 'takeaway' ? 10 : 20);
 
-    // ✅ ADDED: Detect cold drinks
-    const hasColdDrinksInOrder = processedItems.some(
-      item => item.isColdDrink || item.type === 'cold_drink'
-    );
+    const hasColdDrinksInOrder = processedItems.some(i => i.isColdDrink || i.type === 'cold_drink');
 
-    let cashierNote = '';
-    if (orderType === 'takeaway') {
-      cashierNote = `🥡 Takeaway — ${customerName} | ${customerPhone}`;
-    } else {
-      cashierNote = `🚚 Delivery — ${customerName} | ${customerPhone}`;
-    }
+    // ── Initial states based on system settings ────────────────────────────
+    const initialStatus = kitchenSystemEnabled ? 'pending' : 'ready';
+    const initialStockDed = !kitchenSystemEnabled;
+    const coldDrinksStatus = (!hasColdDrinksInOrder || !barmanSystemEnabled)
+      ? 'delivered'
+      : 'pending';
+
+    let cashierNote = orderType === 'takeaway'
+      ? `🥡 Takeaway — ${customerName} | ${customerPhone}`
+      : `🚚 Delivery — ${customerName} | ${customerPhone}`;
 
     const orderData = {
       orderNumber: await generateOrderNumber(),
-      branchId: req.user.branchId,
+      branchId,
       orderType,
       items: processedItems,
       subtotal, tax, total, estimatedTime,
       deliveryBoyId: req.user._id,
-      customerName, customerPhone,
-      notes,
-      cashierNote,
-      status: 'pending',
-      // ✅ ADDED: Cold drinks flags
+      customerName, customerPhone, notes, cashierNote,
+      status: initialStatus,
+      stockDeducted: initialStockDed,
       hasColdDrinks: hasColdDrinksInOrder,
-      coldDrinksStatus: hasColdDrinksInOrder ? 'pending' : 'delivered',
+      coldDrinksStatus,
     };
-
-    if (orderType === 'delivery' && deliveryAddress) {
-      orderData.deliveryAddress = deliveryAddress;
-    }
+    if (orderType === 'delivery' && deliveryAddress) orderData.deliveryAddress = deliveryAddress;
 
     const order = await Order.create(orderData);
+
+    // ── Deduct immediately if systems are OFF ──────────────────────────────
+    if (!kitchenSystemEnabled) {
+      await deductFoodIngredientsForOrder(processedItems);
+    }
+    if (hasColdDrinksInOrder && !barmanSystemEnabled) {
+      await deductColdDrinksForOrder(processedItems);
+    }
 
     const populatedOrder = await Order.findById(order._id)
       .populate('deliveryBoyId', 'name phone')
       .populate('items.itemId', 'name');
 
-    // ✅ ADDED: Barman ko notify karo agar cold drinks hain
     const io = req.app.get('io');
-    if (io && hasColdDrinksInOrder) {
-      io.to(`branch-${String(req.user.branchId)}`).emit('new-colddrink-order', {
-        orderId: String(order._id),
-        orderNumber: order.orderNumber,
-        orderType: order.orderType,
-        total: order.total,
-        customerName,
+    if (io && hasColdDrinksInOrder && barmanSystemEnabled) {
+      io.to(`branch-${String(branchId)}`).emit('new-colddrink-order', {
+        orderId: String(order._id), orderNumber: order.orderNumber,
+        orderType: order.orderType, total: order.total, customerName,
         coldDrinkItems: processedItems
           .filter(i => i.isColdDrink || i.type === 'cold_drink')
-          .map(i => ({
-            name: i.name,
-            size: i.size || null,
-            quantity: i.quantity,
-          })),
+          .map(i => ({ name: i.name, size: i.size || null, quantity: i.quantity })),
         message: `🧃 New cold drink order #${order.orderNumber}`,
       });
     }
@@ -176,9 +164,8 @@ exports.createDeliveryOrder = async (req, res) => {
     res.status(201).json({
       success: true,
       order: populatedOrder,
-      message: orderType === 'takeaway'
-        ? '🥡 Takeaway order kitchen mein bhej diya!'
-        : '🚚 Delivery order create ho gaya!',
+      systemInfo: { kitchenSystemEnabled, barmanSystemEnabled },
+      message: orderType === 'takeaway' ? '🥡 Takeaway order kitchen mein bhej diya!' : '🚚 Delivery order create ho gaya!',
     });
   } catch (error) {
     console.error('Create delivery order error:', error);
