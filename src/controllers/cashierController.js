@@ -627,7 +627,10 @@ exports.getCashierShiftReport = async (req, res) => {
     // ── Expenses in range ──
     const expenses = await Expense.find({
       branchId,
-      date: { $gte: start, $lte: end },
+      $or: [
+        { createdAt: { $gte: start, $lte: end } },
+        { date: { $gte: start, $lte: end } },
+      ],
     }).populate('addedBy', 'name');
 
     // ── Revenue summary ──
