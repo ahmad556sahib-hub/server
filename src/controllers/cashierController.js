@@ -552,7 +552,7 @@ exports.getHourlyIncomeReport = async (req, res) => {
       hourlyData[h] = {
         hour: h,
         label: `${h.toString().padStart(2, '0')}:00 - ${(h + 1).toString().padStart(2, '0')}:00`,
-        totalAmount: 0, orderCount: 0, cash: 0, card: 0, online: 0,
+        totalAmount: 0, orderCount: 0, cash: 0, mezan_bank: 0, online: 0,
       };
     }
 
@@ -561,7 +561,7 @@ exports.getHourlyIncomeReport = async (req, res) => {
       hourlyData[hour].totalAmount += payment.amount;
       hourlyData[hour].orderCount += 1;
       if (payment.method === 'cash') hourlyData[hour].cash += payment.amount;
-      else if (payment.method === 'card') hourlyData[hour].card += payment.amount;
+      else if (payment.method === 'mezan_bank') hourlyData[hour].mezan_bank += payment.amount;
       else if (payment.method === 'online') hourlyData[hour].online += payment.amount;
     });
 
@@ -570,7 +570,7 @@ exports.getHourlyIncomeReport = async (req, res) => {
       totalRevenue: payments.reduce((s, p) => s + p.amount, 0),
       totalOrders: payments.length,
       cashTotal: payments.filter(p => p.method === 'cash').reduce((s, p) => s + p.amount, 0),
-      cardTotal: payments.filter(p => p.method === 'card').reduce((s, p) => s + p.amount, 0),
+      mezan_bankTotal: payments.filter(p => p.method === 'mezan_bank').reduce((s, p) => s + p.amount, 0),
       onlineTotal: payments.filter(p => p.method === 'online').reduce((s, p) => s + p.amount, 0),
       peakHour: hourlyArray.length > 0
         ? hourlyArray.reduce((max, h) => h.totalAmount > max.totalAmount ? h : max, hourlyArray[0])
@@ -593,17 +593,33 @@ exports.getCashierShiftReport = async (req, res) => {
     const { startDateTime, endDateTime } = req.query;
 
     if (!startDateTime || !endDateTime) {
-      return res.status(400).json({ success: false, message: 'startDateTime aur endDateTime zaroori hain' });
+      return res.status(400).json({
+        success: false,
+        message: 'startDateTime aur endDateTime zaroori hain',
+      });
     }
 
-    const start = new Date(startDateTime);
-    const end = new Date(endDateTime);
+    // ✅ FIX: If datetime string has timezone info (+05:00), parse directly.
+    // If NOT (naive string like "2026-04-23T09:00:00"), treat as PKT and convert to UTC.
+    const PKT_OFFSET_MS = 5 * 60 * 60 * 1000;
+
+    function parsePKT(dtStr) {
+      // Has timezone offset (+05:00, Z, etc.)? Parse as-is.
+      if (dtStr.includes('+') || dtStr.endsWith('Z')) {
+        return new Date(dtStr);
+      }
+      // Naive string → treat as PKT → subtract 5h to get UTC
+      return new Date(new Date(dtStr).getTime() - PKT_OFFSET_MS);
+    }
+
+    const start = parsePKT(startDateTime);
+    const end = parsePKT(endDateTime);
 
     // ── Payments in range ──
     const payments = await Payment.find({
       branchId,
       paidAt: { $gte: start, $lte: end },
-      status: 'paid',               // ← only fully completed payments
+      status: 'paid',
     })
       .populate('cashierId', 'name')
       .populate('orderId', 'orderNumber orderType');
@@ -617,7 +633,7 @@ exports.getCashierShiftReport = async (req, res) => {
     // ── Revenue summary ──
     const totalRevenue = payments.reduce((s, p) => s + p.amount, 0);
     const cashReceived = payments.filter(p => p.method === 'cash').reduce((s, p) => s + p.amount, 0);
-    const cardReceived = payments.filter(p => p.method === 'card').reduce((s, p) => s + p.amount, 0);
+    const mezan_bankReceived = payments.filter(p => p.method === 'mezan_bank').reduce((s, p) => s + p.amount, 0);
     const onlineReceived = payments.filter(p => p.method === 'online').reduce((s, p) => s + p.amount, 0);
     const jazzReceived = payments.filter(p => p.method === 'jazz_cash').reduce((s, p) => s + p.amount, 0);
     const easyReceived = payments.filter(p => p.method === 'easypaisa').reduce((s, p) => s + p.amount, 0);
@@ -625,7 +641,6 @@ exports.getCashierShiftReport = async (req, res) => {
     // ── Expense summary ──
     const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
 
-    // ✅ NEW: Expense breakdown by payment method
     const expensesByMethod = {};
     expenses.forEach(e => {
       const method = e.paymentMethod || 'cash';
@@ -636,19 +651,25 @@ exports.getCashierShiftReport = async (req, res) => {
 
     res.json({
       success: true,
-      period: { start: start.toISOString(), end: end.toISOString() },
+      period: {
+        start: start.toISOString(),
+        end: end.toISOString(),
+        // ✅ Human-readable PKT times for debugging
+        startPKT: new Date(start.getTime() + PKT_OFFSET_MS).toISOString().replace('T', ' ').substring(0, 16),
+        endPKT: new Date(end.getTime() + PKT_OFFSET_MS).toISOString().replace('T', ' ').substring(0, 16),
+      },
       payments,
       expenses,
       summary: {
         totalOrders: payments.length,
         totalRevenue,
         cashReceived,
-        cardReceived,
+        mezan_bankReceived,   // ✅ consistent key
         onlineReceived,
         jazzReceived,
         easyReceived,
         totalExpenses,
-        expensesByMethod,   // ✅ NEW
+        expensesByMethod,
         netAmount,
       },
     });
@@ -1003,17 +1024,16 @@ exports.getAmountSummary = async (req, res) => {
       .populate('orderId', 'orderNumber orderType')
       .sort({ paidAt: -1 });
 
-    // Breakdown by method
-    const breakdown = {};
-    for (const m of ['cash', 'card', 'online', 'jazz_cash', 'easypaisa']) {
-      breakdown[`${m}Total`] = payments
-        .filter(p => p.method === m)
-        .reduce((s, p) => s + p.amount, 0);
-    }
-
-    const totalRevenue = payments.reduce((s, p) => s + p.amount, 0);
-    const totalTransactions = payments.length;
-    const recentPayments = payments.slice(0, 10);
+    // ✅ Keys MUST match frontend exactly
+    const summary = {
+      totalRevenue: payments.reduce((s, p) => s + p.amount, 0),
+      totalTransactions: payments.length,
+      cashTotal: payments.filter(p => p.method === 'cash').reduce((s, p) => s + p.amount, 0),
+      mezan_bankTotal: payments.filter(p => p.method === 'mezan_bank').reduce((s, p) => s + p.amount, 0),
+      onlineTotal: payments.filter(p => p.method === 'online').reduce((s, p) => s + p.amount, 0),
+      jazz_cashTotal: payments.filter(p => p.method === 'jazz_cash').reduce((s, p) => s + p.amount, 0),
+      easypaisaTotal: payments.filter(p => p.method === 'easypaisa').reduce((s, p) => s + p.amount, 0),
+    };
 
     res.json({
       success: true,
@@ -1021,12 +1041,8 @@ exports.getAmountSummary = async (req, res) => {
         start: sessionStart.toISOString(),
         end: sessionEnd.toISOString(),
       },
-      summary: {
-        totalRevenue,
-        totalTransactions,
-        ...breakdown,
-      },
-      recentPayments,
+      summary,
+      recentPayments: payments.slice(0, 10),
     });
   } catch (error) {
     console.error('Amount summary error:', error);
@@ -1146,7 +1162,7 @@ exports.replaceOrderPayment = async (req, res) => {
       return res.status(400).json({ success: false, message: 'newMethod zaroori hai' });
     }
 
-    const validMethods = ['cash', 'card', 'online', 'jazz_cash', 'easypaisa'];
+    const validMethods = ['cash', 'mezan_bank', 'online', 'jazz_cash', 'easypaisa'];
     if (!validMethods.includes(newMethod)) {
       return res.status(400).json({
         success: false,

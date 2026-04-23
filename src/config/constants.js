@@ -36,7 +36,7 @@ const PaymentStatus = {
 
 const PaymentMethod = {
   CASH: 'cash',
-  CARD: 'card',
+  MEZAN_BANK: 'mezan_bank',
   ONLINE: 'online',
   JAZZ_CASH: 'jazz_cash',
   EASYPAISA: 'easypaisa',
